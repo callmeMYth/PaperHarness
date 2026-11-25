@@ -1,0 +1,118 @@
+name: CI & Windows EXE Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    name: Verify Frontend & Backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: TypeScript check & Vite build
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python backend dependencies (Linux headless)
+        run: |
+          python -m pip install --upgrade pip
+          grep -v -i "^pywebview" requirements.txt > /tmp/req_ci.txt
+          pip install -r /tmp/req_ci.txt
+
+      - name: Run backend smoke tests
+        run: |
+          python - << 'EOF'
+          from fastapi.testclient import TestClient
+          from backend.main import app
+          from backend.services.terminology_and_search import load_glossary
+          from backend.services.diagram_studio import (
+              make_procedural_icon_png,
+              export_diagram_pptx_bytes,
+              DIAGRAM_TEMPLATES,
+          )
+
+          client = TestClient(app)
+          assert client.get("/api/health").json()["ok"] is True
+          assert len(load_glossary()) >= 40
+          assert make_procedural_icon_png("conv_stack_3d", "#1E3A5F")[:8] == b"\x89PNG\r\n\x1a\n"
+          assert len(export_diagram_pptx_bytes(DIAGRAM_TEMPLATES["hierattn_cvpr"])) > 15000
+          print("CI smoke tests passed!")
+          EOF
+
+  release-windows-exe:
+    name: Build Portable Windows EXE
+    needs: verify
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend dist
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build standalone PaperHarness.exe
+        run: python build_exe.py
+
+      - name: Package clean Windows ZIP
+        shell: pwsh
+        run: |
+          if (Test-Path release\PaperHarness\local_data) { Remove-Item -Recurse -Force release\PaperHarness\local_data }
+          Compress-Archive -Path release\PaperHarness -DestinationPath PaperHarness_Windows_x64.zip -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PaperHarness-Windows-x64
+          path: PaperHarness_Windows_x64.zip
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: PaperHarness_Windows_x64.zip
+          generate_release_notes: true

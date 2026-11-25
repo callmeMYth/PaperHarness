@@ -1,0 +1,45 @@
+# --- Secrets & Runtime User Data (NEVER commit!) ---
+local_data/
+*.env
+.env*
+settings.json
+user_glossary.json
+startup_error.log
+
+# --- Python Environments & Bytecode ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Node / Frontend Dependencies (keep frontend/dist/ tracked for zero-Node quick launch) ---
+frontend/node_modules/
+frontend/.vite/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# --- PyInstaller & Release Artifacts ---
+release/
+build_pyi/
+build/
+*.spec
+*.exe
+*.zip
+
+# --- OS / IDE Noise ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.bak
+*.log
