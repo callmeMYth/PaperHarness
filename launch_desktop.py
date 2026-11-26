@@ -241,9 +241,9 @@ def main() -> None:
         log_path = ROOT / "local_data" / "startup_error.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(err, encoding="utf-8")
-        if IS_FROZEN:
+        if IS_FROZEN or "pythonw" in Path(sys.executable).name.lower():
             _alert_error(
-                "PaperHarness 桌面窗口启动失败，请确认 Windows 已安装 Microsoft Edge WebView2 运行时。\n\n"
+                "PaperHarness 桌面窗口启动失败，请检查 Python 依赖或 Microsoft Edge WebView2 运行时。\n\n"
                 f"详细日志：{log_path}"
             )
         raise
