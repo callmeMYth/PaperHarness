@@ -4,7 +4,7 @@ export interface ProviderConfig {
   id: string;
   name: string;
   region: 'domestic' | 'international' | 'local' | 'custom';
-  protocol: 'openai' | 'anthropic' | 'anthropic_relay';
+  protocol: 'openai' | 'anthropic' | 'anthropic_relay' | 'gemini_native';
   base_url: string;
   has_key: boolean;
   api_key_masked: string;

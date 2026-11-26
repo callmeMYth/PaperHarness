@@ -37,7 +37,7 @@ export const ModelHubModal: React.FC<Props> = ({ open, initialTab, lang, t, sett
   const [selectedId, setSelectedId] = useState<string>('deepseek');
   const [keyInput, setKeyInput] = useState('');
   const [urlInput, setUrlInput] = useState('');
-  const [protoInput, setProtoInput] = useState<'openai' | 'anthropic' | 'anthropic_relay'>('openai');
+  const [protoInput, setProtoInput] = useState<'openai' | 'anthropic' | 'anthropic_relay' | 'gemini_native'>('openai');
   const [modelInput, setModelInput] = useState('');
   const [fetchedModels, setFetchedModels] = useState<string[]>([]);
   const [fetching, setFetching] = useState(false);
@@ -549,11 +549,12 @@ export const ModelHubModal: React.FC<Props> = ({ open, initialTab, lang, t, sett
                     <select
                       className="select"
                       value={protoInput}
-                      onChange={(e) => setProtoInput(e.target.value as 'openai' | 'anthropic' | 'anthropic_relay')}
+                      onChange={(e) => setProtoInput(e.target.value as 'openai' | 'anthropic' | 'anthropic_relay' | 'gemini_native')}
                     >
                       <option value="openai">{t.proto_openai}</option>
                       <option value="anthropic">{t.proto_anthropic}</option>
                       <option value="anthropic_relay">{t.proto_claude_relay}</option>
+                      <option value="gemini_native">Gemini 原生 (/v1beta)</option>
                     </select>
                   </div>
                 </div>

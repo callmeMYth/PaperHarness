@@ -164,9 +164,41 @@ def _format_messages_anthropic(messages: list[dict[str, Any]]) -> list[dict[str,
     return out
 
 
+def _format_messages_gemini(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        role = "model" if msg.get("role") == "assistant" else "user"
+        text = str(msg.get("content") or "")
+        images = msg.get("images") or []
+        parts: list[dict[str, Any]] = []
+        if images and role == "user":
+            for img in images:
+                mime, b64 = _split_data_url(str(img))
+                parts.append({"inlineData": {"mimeType": mime, "data": b64}})
+        if text or not parts:
+            parts.append({"text": text or "请查看这张图片"})
+        out.append({"role": role, "parts": parts})
+    return out
+
+
 def _extract_events_from_json_chunk(evt: dict[str, Any]) -> list[dict[str, str]]:
-    """Extract normalized `thinking` and `text` chunks from Anthropic SSE, OpenAI SSE, or non-stream JSON."""
+    """Extract normalized `thinking` and `text` chunks from Anthropic SSE, OpenAI SSE, Gemini v1beta SSE, or non-stream JSON."""
     out: list[dict[str, str]] = []
+    # 1. Gemini native v1beta (`candidates[].content.parts[]` with `thought: true`)
+    cands = evt.get("candidates")
+    if isinstance(cands, list) and cands:
+        parts = ((cands[0] or {}).get("content") or {}).get("parts") or []
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            ptxt = part.get("text") or ""
+            if not ptxt:
+                continue
+            if part.get("thought") is True:
+                out.append({"kind": "thinking", "text": str(ptxt)})
+            else:
+                out.append({"kind": "text", "text": str(ptxt)})
+        return out
     etype = evt.get("type")
     if etype == "content_block_delta":
         d = evt.get("delta") or {}
@@ -265,6 +297,94 @@ async def _raw_stream_multimodal_events(
         raise RuntimeError("尚未选择模型，请点击「拉取模型」后选择具体模型 ID。")
 
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
+        # Gemini Native v1beta protocol (also auto-used when selecting a `gemini*` model on a multi-protocol relay!)
+        use_gemini_native = protocol == "gemini_native" or (
+            protocol == "anthropic_relay" and "gemini" in model.lower()
+        )
+        if use_gemini_native:
+            g_base = re.sub(r"/v1beta(?:/openai)?$|/v1$", "", base_url)
+            ep_sse = f"{g_base}/v1beta/models/{model}:streamGenerateContent?alt=sse"
+            ep_sync = f"{g_base}/v1beta/models/{model}:generateContent"
+            hdrs = {
+                "content-type": "application/json",
+                "x-goog-api-key": api_key,
+                "Authorization": f"Bearer {api_key}",
+            }
+            gen_cfg: dict[str, Any] = {"temperature": temperature}
+            if enable_thinking:
+                gen_cfg["thinkingConfig"] = {"includeThoughts": True}
+            base_g_payload: dict[str, Any] = {
+                "systemInstruction": {"parts": [{"text": system_prompt}]},
+                "contents": _format_messages_gemini(messages),
+                "generationConfig": gen_cfg,
+            }
+            payload_variants = [base_g_payload]
+            if enable_thinking:
+                fallback_g = {
+                    **base_g_payload,
+                    "generationConfig": {"temperature": temperature},
+                }
+                payload_variants.append(fallback_g)
+
+            last_err = ""
+            for p_idx, g_payload in enumerate(payload_variants):
+                async with client.stream("POST", ep_sse, headers=hdrs, json=g_payload) as resp:
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    if resp.status_code == 400 and enable_thinking and p_idx == 0:
+                        body = await resp.aread()
+                        last_err = f"HTTP 400: {body.decode('utf-8', 'ignore')[:220]}"
+                        continue
+                    if resp.status_code >= 400:
+                        body = await resp.aread()
+                        last_err = f"Gemini API HTTP {resp.status_code} ({ep_sse}): {body.decode('utf-8', 'ignore')[:260]}"
+                        if resp.status_code == 404:
+                            break
+                        raise RuntimeError(last_err)
+                    if "text/html" in ctype:
+                        last_err = f"接口 {ep_sse} 返回了网页 HTML"
+                        break
+                    if "application/json" in ctype and "event-stream" not in ctype:
+                        body = await resp.aread()
+                        obj = json.loads(body.decode("utf-8", "ignore"))
+                        items = obj if isinstance(obj, list) else [obj]
+                        for item in items:
+                            if isinstance(item, dict):
+                                if "error" in item:
+                                    raise RuntimeError(f"Gemini API 错误：{item['error']}")
+                                for ev in _extract_events_from_json_chunk(item):
+                                    yield ev
+                        return
+                    yielded_any = False
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line[5:].strip()
+                        if not raw or raw == "[DONE]":
+                            continue
+                        try:
+                            evt = json.loads(raw)
+                            if "error" in evt and not evt.get("candidates"):
+                                raise RuntimeError(f"Gemini API 流错误：{evt['error']}")
+                            for ev in _extract_events_from_json_chunk(evt):
+                                yielded_any = True
+                                yield ev
+                        except RuntimeError:
+                            raise
+                        except Exception:
+                            continue
+                    if yielded_any:
+                        return
+            # Fallback to non-stream `:generateContent` if SSE stream wasn't supported by relay
+            r_sync = await client.post(ep_sync, headers=hdrs, json=payload_variants[-1])
+            if r_sync.status_code >= 400:
+                raise RuntimeError(f"Gemini API HTTP {r_sync.status_code}: {r_sync.text[:260]}")
+            obj = r_sync.json()
+            if "error" in obj:
+                raise RuntimeError(f"Gemini API 错误：{obj['error']}")
+            for ev in _extract_events_from_json_chunk(obj):
+                yield ev
+            return
+
         if protocol in ("anthropic", "anthropic_relay"):
             base_payload: dict[str, Any] = {
                 "model": model,
