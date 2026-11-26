@@ -612,12 +612,15 @@ async def api_agent_stream(req: AgentRunReq) -> StreamingResponse:
 class OmniChatReq(BaseModel):
     messages: list[dict[str, Any]]
     context: dict[str, Any] = {}
+    enable_thinking: bool = False
 
 
 @app.post("/api/chat/stream")
 async def api_chat_stream(req: OmniChatReq) -> StreamingResponse:
     async def event_gen():
-        async for evt in stream_omni_chat(messages=req.messages, context=req.context):
+        async for evt in stream_omni_chat(
+            messages=req.messages, context=req.context, enable_thinking=req.enable_thinking
+        ):
             yield f"data: {json.dumps(evt, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")

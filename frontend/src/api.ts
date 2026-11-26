@@ -244,7 +244,11 @@ export const streamDiagramAgents = (
 ) => readSse('/api/diagrams/generate-stream', payload, onEvent);
 
 export const streamOmniChat = (
-  payload: { messages: Array<{ role: string; content: string; images?: string[] }>; context: Record<string, any> },
+  payload: {
+    messages: Array<{ role: string; content: string; images?: string[] }>;
+    context: Record<string, any>;
+    enable_thinking?: boolean;
+  },
   onEvent: (evt: any) => void,
   signal?: AbortSignal,
 ) => readSse('/api/chat/stream', payload, onEvent, signal);

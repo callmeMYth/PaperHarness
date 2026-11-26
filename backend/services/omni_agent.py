@@ -39,7 +39,7 @@ from backend.services.llm_gateway import (
     _split_data_url,
     resolve_role_provider,
     stream_academic_agent,
-    stream_multimodal_messages,
+    stream_multimodal_events,
 )
 
 TOOL_GUIDE = """You are PaperHarness Omni-Agent — an all-in-one academic research & publishing assistant with direct control over the entire desktop workbench.
@@ -522,8 +522,9 @@ async def _execute_tool(
 async def stream_omni_chat(
     messages: list[dict[str, Any]],
     context: dict[str, Any] | None = None,
+    enable_thinking: bool = False,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Stream multimodal chat + live interception & execution of full-workbench tool calls."""
+    """Stream multimodal chat + live thinking tokens + interception & execution of full-workbench tool calls."""
     ctx = context or {}
     all_images = _collect_conversation_images(messages)
     has_images = bool(all_images)
@@ -568,12 +569,20 @@ async def stream_omni_chat(
     # Trim conversation history to last 12 turns to keep latency snappy
     recent_msgs = messages[-12:]
     full_chunks: list[str] = []
+    thinking_chunks: list[str] = []
     # Stream visible text while withholding ```tool_call ... ``` fences from raw chat output
     buf = ""
     in_tool_fence = False
 
     try:
-        async for delta in stream_multimodal_messages(prov, model, system_prompt, recent_msgs, temperature=0.3):
+        async for ev in stream_multimodal_events(
+            prov, model, system_prompt, recent_msgs, temperature=0.3, enable_thinking=enable_thinking
+        ):
+            if ev["kind"] == "thinking":
+                thinking_chunks.append(ev["text"])
+                yield {"type": "thinking", "text": ev["text"]}
+                continue
+            delta = ev["text"]
             full_chunks.append(delta)
             buf += delta
             while buf:
@@ -605,6 +614,13 @@ async def stream_omni_chat(
         return
 
     full_text = "".join(full_chunks)
+    if not full_text.strip() and not "".join(thinking_chunks).strip():
+        yield {
+            "type": "error",
+            "message": f"{prov['name']} ({model}) 返回了空内容。请检查该模型是否在线、中转站线路是否可用，或在「配置 API」确认 Base URL 是否带 /v1。",
+        }
+        return
+
     tool_calls = _extract_tool_calls(full_text)
     for call in tool_calls[:4]:
         try:

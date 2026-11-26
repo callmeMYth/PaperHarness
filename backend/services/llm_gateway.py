@@ -48,11 +48,11 @@ def _anthropic_headers_variants(api_key: str, protocol: str) -> list[dict[str, s
 
 
 def _candidate_endpoint(base_url: str, suffix: str) -> list[str]:
+    """Always prefer `/v1<suffix>` first when base_url lacks a version segment (prevents hitting SPA HTML pages at `/messages`)."""
     b = _normalize_base(base_url)
-    urls = [f"{b}{suffix}"]
     if not b.endswith("/v1") and not re.search(r"/v\d+$", b):
-        urls.append(f"{b}/v1{suffix}")
-    return urls
+        return [f"{b}/v1{suffix}", f"{b}{suffix}"]
+    return [f"{b}{suffix}"]
 
 
 def resolve_role_provider(
@@ -101,6 +101,10 @@ async def fetch_provider_models(base_url: str, api_key: str, protocol: str = "op
                         r = await client.get(ep, headers=hdrs)
                         ms = int((time.perf_counter() - t0) * 1000)
                         if r.status_code == 200:
+                            ctype = (r.headers.get("content-type") or "").lower()
+                            if "text/html" in ctype or r.text.lstrip().startswith("<"):
+                                last_err = f"接口返回了网页 HTML ({ep})，请检查 Base URL"
+                                continue
                             data = r.json()
                             raw = data.get("data") or data.get("models") or (data if isinstance(data, list) else [])
                             models = sorted({m["id"] if isinstance(m, dict) and "id" in m else str(m) for m in raw if m})
@@ -160,14 +164,98 @@ def _format_messages_anthropic(messages: list[dict[str, Any]]) -> list[dict[str,
     return out
 
 
-async def stream_multimodal_messages(
+def _extract_events_from_json_chunk(evt: dict[str, Any]) -> list[dict[str, str]]:
+    """Extract normalized `thinking` and `text` chunks from Anthropic SSE, OpenAI SSE, or non-stream JSON."""
+    out: list[dict[str, str]] = []
+    etype = evt.get("type")
+    if etype == "content_block_delta":
+        d = evt.get("delta") or {}
+        th = d.get("thinking") or d.get("reasoning") or ""
+        tx = d.get("text") or ""
+        if th:
+            out.append({"kind": "thinking", "text": str(th)})
+        if tx:
+            out.append({"kind": "text", "text": str(tx)})
+        return out
+    if etype == "message" or (isinstance(evt.get("content"), list) and not evt.get("choices")):
+        for blk in evt.get("content") or []:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "thinking" and blk.get("thinking"):
+                out.append({"kind": "thinking", "text": str(blk["thinking"])})
+            elif blk.get("type") == "text" and blk.get("text"):
+                out.append({"kind": "text", "text": str(blk["text"])})
+        return out
+    choices = evt.get("choices") or []
+    if choices:
+        c0 = choices[0] or {}
+        delta = c0.get("delta") or c0.get("message") or {}
+        th = delta.get("reasoning_content") or delta.get("reasoning") or delta.get("thinking") or ""
+        tx = delta.get("content") or ""
+        if th:
+            out.append({"kind": "thinking", "text": str(th)})
+        if isinstance(tx, str) and tx:
+            out.append({"kind": "text", "text": tx})
+        elif isinstance(tx, list):
+            for blk in tx:
+                if isinstance(blk, dict):
+                    if blk.get("type") == "thinking" and blk.get("thinking"):
+                        out.append({"kind": "thinking", "text": str(blk["thinking"])})
+                    elif blk.get("text"):
+                        out.append({"kind": "text", "text": str(blk["text"])})
+    return out
+
+
+async def _split_inline_think_tags(
+    raw_stream: AsyncGenerator[dict[str, str], None],
+) -> AsyncGenerator[dict[str, str], None]:
+    """Also route inline `<think>...</think>` blocks (DeepSeek-R1 / QwQ / local relays) into `thinking` events."""
+    buf = ""
+    in_think = False
+    async for ev in raw_stream:
+        if ev["kind"] == "thinking":
+            yield ev
+            continue
+        buf += ev["text"]
+        while buf:
+            if not in_think:
+                idx = buf.find("<think>")
+                if idx != -1:
+                    if idx > 0:
+                        yield {"kind": "text", "text": buf[:idx]}
+                    buf = buf[idx + 7 :]
+                    in_think = True
+                else:
+                    safe = max(0, len(buf) - 7)
+                    if safe > 0:
+                        yield {"kind": "text", "text": buf[:safe]}
+                        buf = buf[safe:]
+                    break
+            else:
+                end = buf.find("</think>")
+                if end != -1:
+                    if end > 0:
+                        yield {"kind": "thinking", "text": buf[:end]}
+                    buf = buf[end + 8 :]
+                    in_think = False
+                else:
+                    safe = max(0, len(buf) - 8)
+                    if safe > 0:
+                        yield {"kind": "thinking", "text": buf[:safe]}
+                        buf = buf[safe:]
+                    break
+    if buf:
+        yield {"kind": "thinking" if in_think else "text", "text": buf}
+
+
+async def _raw_stream_multimodal_events(
     prov: dict[str, Any],
     model: str,
     system_prompt: str,
     messages: list[dict[str, Any]],
     temperature: float = 0.25,
-) -> AsyncGenerator[str, None]:
-    """Stream tokens for text or multimodal (text + images) turns across OpenAI, Anthropic, and Claude 3rd-party relays."""
+    enable_thinking: bool = False,
+) -> AsyncGenerator[dict[str, str], None]:
     protocol = prov.get("protocol", "openai")
     base_url = _normalize_base(prov.get("base_url", ""))
     api_key = prov.get("api_key", "")
@@ -178,49 +266,88 @@ async def stream_multimodal_messages(
 
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
         if protocol in ("anthropic", "anthropic_relay"):
-            payload = {
+            base_payload: dict[str, Any] = {
                 "model": model,
-                "max_tokens": 4096,
-                "temperature": temperature,
+                "max_tokens": 8192 if enable_thinking else 4096,
                 "system": system_prompt,
                 "messages": _format_messages_anthropic(messages),
                 "stream": True,
             }
+            if enable_thinking:
+                base_payload["thinking"] = {"type": "enabled", "budget_tokens": 4096}
+            else:
+                base_payload["temperature"] = temperature
+
             endpoints = _candidate_endpoint(base_url, "/messages")
             header_sets = _anthropic_headers_variants(api_key, protocol)
+            payload_variants = [base_payload]
+            if enable_thinking:
+                fallback_p = {k: v for k, v in base_payload.items() if k != "thinking"}
+                fallback_p["max_tokens"] = 4096
+                fallback_p["temperature"] = temperature
+                payload_variants.append(fallback_p)
+
             last_err = ""
             for ep in endpoints:
                 for hdrs in header_sets:
-                    async with client.stream("POST", ep, headers=hdrs, json=payload) as resp:
-                        if resp.status_code in (401, 403, 404) and protocol == "anthropic_relay":
-                            body = await resp.aread()
-                            last_err = f"HTTP {resp.status_code}: {body.decode('utf-8', 'ignore')[:220]}"
-                            continue
-                        if resp.status_code >= 400:
-                            body = await resp.aread()
-                            raise RuntimeError(f"Claude API HTTP {resp.status_code}: {body.decode('utf-8', 'ignore')[:260]}")
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data:"):
-                                continue
-                            raw = line[5:].strip()
-                            if not raw or raw == "[DONE]":
-                                continue
-                            try:
-                                evt = json.loads(raw)
-                                if evt.get("type") == "content_block_delta":
-                                    delta = evt.get("delta", {}).get("text", "")
-                                    if delta:
-                                        yield delta
-                                elif "choices" in evt:
-                                    delta = (evt["choices"][0].get("delta") or {}).get("content") or ""
-                                    if delta:
-                                        yield delta
-                            except Exception:
-                                continue
-                        return
-            raise RuntimeError(f"Claude 第三方中转连接失败：{last_err}")
+                    for p_idx, payload in enumerate(payload_variants):
+                        async with client.stream("POST", ep, headers=hdrs, json=payload) as resp:
+                            ctype = (resp.headers.get("content-type") or "").lower()
+                            if resp.status_code == 400 and enable_thinking and p_idx == 0:
+                                body = await resp.aread()
+                                last_err = f"HTTP 400: {body.decode('utf-8', 'ignore')[:220]}"
+                                continue  # Retry cleanly without `thinking` if model doesn't support it
+                            if resp.status_code in (401, 403, 404) and protocol == "anthropic_relay":
+                                body = await resp.aread()
+                                last_err = f"HTTP {resp.status_code} ({ep}): {body.decode('utf-8', 'ignore')[:220]}"
+                                break
+                            if resp.status_code >= 400:
+                                body = await resp.aread()
+                                raise RuntimeError(f"Claude API HTTP {resp.status_code} ({ep}): {body.decode('utf-8', 'ignore')[:260]}")
+                            if "text/html" in ctype:
+                                body = await resp.aread()
+                                last_err = f"接口 {ep} 返回了网页 HTML 而非模型数据流（请确认 Base URL 或中转站路径）"
+                                break
+                            if "application/json" in ctype and "event-stream" not in ctype:
+                                body = await resp.aread()
+                                txt = body.decode("utf-8", "ignore").strip()
+                                if txt.startswith("<"):
+                                    last_err = f"接口 {ep} 返回了网页 HTML 而非模型数据流"
+                                    break
+                                obj = json.loads(txt)
+                                if "error" in obj:
+                                    raise RuntimeError(f"Claude API 错误：{obj['error']}")
+                                for ev in _extract_events_from_json_chunk(obj):
+                                    yield ev
+                                return
+                            yielded_any = False
+                            raw_preview: list[str] = []
+                            async for line in resp.aiter_lines():
+                                if len(raw_preview) < 4 and line.strip():
+                                    raw_preview.append(line.strip()[:160])
+                                if not line.startswith("data:"):
+                                    continue
+                                raw = line[5:].strip()
+                                if not raw or raw == "[DONE]":
+                                    continue
+                                try:
+                                    evt = json.loads(raw)
+                                    if evt.get("type") == "error" or ("error" in evt and not evt.get("choices")):
+                                        raise RuntimeError(f"API 流错误：{evt.get('error') or evt}")
+                                    for ev in _extract_events_from_json_chunk(evt):
+                                        yielded_any = True
+                                        yield ev
+                                except RuntimeError:
+                                    raise
+                                except Exception:
+                                    continue
+                            if not yielded_any and raw_preview and raw_preview[0].startswith("<"):
+                                last_err = f"接口 {ep} 返回了网页 HTML，未输出模型内容"
+                                break
+                            return
+            raise RuntimeError(f"Claude 第三方中转连接失败：{last_err or '未获取到有效响应'}")
 
-        # OpenAI-compatible protocol (supports vision `image_url` blocks natively)
+        # OpenAI-compatible protocol (supports vision `image_url` blocks & reasoning_content natively)
         headers = {"content-type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
@@ -230,25 +357,75 @@ async def stream_multimodal_messages(
             "messages": _format_messages_openai(system_prompt, messages),
             "stream": True,
         }
-        async with client.stream("POST", f"{base_url}/chat/completions", headers=headers, json=payload) as resp:
-            if resp.status_code >= 400:
-                body = await resp.aread()
-                raise RuntimeError(f"API HTTP {resp.status_code}: {body.decode('utf-8', 'ignore')[:260]}")
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
+        endpoints = _candidate_endpoint(base_url, "/chat/completions")
+        last_err = ""
+        for ep in endpoints:
+            async with client.stream("POST", ep, headers=headers, json=payload) as resp:
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if resp.status_code == 404 and len(endpoints) > 1:
+                    body = await resp.aread()
+                    last_err = f"HTTP 404 ({ep}): {body.decode('utf-8', 'ignore')[:200]}"
                     continue
-                raw = line[5:].strip()
-                if not raw or raw == "[DONE]":
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise RuntimeError(f"API HTTP {resp.status_code}: {body.decode('utf-8', 'ignore')[:260]}")
+                if "text/html" in ctype:
+                    last_err = f"接口 {ep} 返回了网页 HTML 而非模型数据流"
                     continue
-                try:
-                    evt = json.loads(raw)
-                    choices = evt.get("choices") or []
-                    if choices:
-                        delta = choices[0].get("delta", {}).get("content") or ""
-                        if delta:
-                            yield delta
-                except Exception:
-                    continue
+                if "application/json" in ctype and "event-stream" not in ctype:
+                    body = await resp.aread()
+                    obj = json.loads(body.decode("utf-8", "ignore"))
+                    if "error" in obj:
+                        raise RuntimeError(f"API 错误：{obj['error']}")
+                    for ev in _extract_events_from_json_chunk(obj):
+                        yield ev
+                    return
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw or raw == "[DONE]":
+                        continue
+                    try:
+                        evt = json.loads(raw)
+                        if "error" in evt and not evt.get("choices"):
+                            raise RuntimeError(f"API 流错误：{evt['error']}")
+                        for ev in _extract_events_from_json_chunk(evt):
+                            yield ev
+                    except RuntimeError:
+                        raise
+                    except Exception:
+                        continue
+                return
+        raise RuntimeError(f"API 连接失败：{last_err or '未获取到有效响应'}")
+
+
+async def stream_multimodal_events(
+    prov: dict[str, Any],
+    model: str,
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    temperature: float = 0.25,
+    enable_thinking: bool = False,
+) -> AsyncGenerator[dict[str, str], None]:
+    """Stream structured `thinking` and `text` chunks across OpenAI, Anthropic, and 3rd-party relays."""
+    async for ev in _split_inline_think_tags(
+        _raw_stream_multimodal_events(prov, model, system_prompt, messages, temperature=temperature, enable_thinking=enable_thinking)
+    ):
+        yield ev
+
+
+async def stream_multimodal_messages(
+    prov: dict[str, Any],
+    model: str,
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    temperature: float = 0.25,
+) -> AsyncGenerator[str, None]:
+    """Backward-compatible text-only token stream (filters out reasoning/thinking tokens for structured callers)."""
+    async for ev in stream_multimodal_events(prov, model, system_prompt, messages, temperature=temperature, enable_thinking=False):
+        if ev["kind"] == "text":
+            yield ev["text"]
 
 
 async def stream_llm_completion(

@@ -3,7 +3,10 @@ import {
   ArrowLeftRight,
   ArrowUp,
   ArrowUpRight,
+  Brain,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Copy,
   FileUp,
   ImagePlus,
@@ -37,6 +40,8 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  thinking?: string;
+  thinkingDone?: boolean;
   images?: string[];
   tools?: ToolRunItem[];
   needApiKey?: string;
@@ -166,6 +171,8 @@ export const ConversationPane: React.FC<Props> = ({
   const [pendingImages, setPendingImages] = useState<string[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [showQuickBar, setShowQuickBar] = useState(true);
+  const [enableThinking, setEnableThinking] = useState(true);
+  const [collapsedThinking, setCollapsedThinking] = useState<Record<string, boolean>>({});
 
   const draftsRef = useRef<Record<string, string>>({});
   const prevSidRef = useRef<string>(sessionId);
@@ -250,12 +257,18 @@ export const ConversationPane: React.FC<Props> = ({
 
     try {
       await streamOmniChat(
-        { messages: historyPayload, context: workspaceContext },
+        { messages: historyPayload, context: workspaceContext, enable_thinking: enableThinking },
         (evt) => {
           if (evt.type === 'need_api_key') {
             patchAsst((m) => ({ ...m, needApiKey: evt.message }));
+          } else if (evt.type === 'thinking') {
+            patchAsst((m) => ({ ...m, thinking: (m.thinking || '') + (evt.text || ''), thinkingDone: false }));
           } else if (evt.type === 'token') {
-            patchAsst((m) => ({ ...m, content: m.content + (evt.text || '') }));
+            patchAsst((m) => ({
+              ...m,
+              content: m.content + (evt.text || ''),
+              ...(m.thinking ? { thinkingDone: true } : {}),
+            }));
           } else if (evt.type === 'tool_start') {
             const todoId = `${asstId}-${evt.tool}`;
             onTodoUpdate(targetSid, (prev) => {
@@ -326,7 +339,11 @@ export const ConversationPane: React.FC<Props> = ({
           } else if (evt.type === 'error') {
             patchAsst((m) => ({ ...m, content: m.content + (m.content ? '\n\n' : '') + `⚠ ${evt.message}` }));
           } else if (evt.type === 'done') {
-            patchAsst((m) => ({ ...m, meta: `${evt.provider} · ${evt.model}` }));
+            patchAsst((m) => ({
+              ...m,
+              ...(m.thinking ? { thinkingDone: true } : {}),
+              meta: `${evt.provider} · ${evt.model}`,
+            }));
           }
         },
         ctrl.signal,
@@ -453,6 +470,18 @@ export const ConversationPane: React.FC<Props> = ({
           >
             <Sparkles size={15.5} />
           </button>
+          <button
+            className={`think-pill ${enableThinking ? 'active' : ''}`}
+            title={
+              lang === 'zh'
+                ? '开启后主动请求模型展示深度思考过程（推理模型如 DeepSeek-R1 / QwQ / Gemini-Thinking 默认自动展示）'
+                : 'Request extended thinking / reasoning trace when supported'
+            }
+            onClick={() => setEnableThinking((v) => !v)}
+          >
+            <Brain size={13.5} />
+            <span>{lang === 'zh' ? '深度思考' : 'Think'}</span>
+          </button>
         </div>
 
         {isStreaming ? (
@@ -566,7 +595,32 @@ export const ConversationPane: React.FC<Props> = ({
                   </div>
                 )}
 
-                {(m.content.trim() || (m.role === 'assistant' && isStreaming && !m.needApiKey && !(m.tools && m.tools.length))) && (
+                {m.thinking && m.thinking.trim() && (
+                  <div className="thinking-card view-fade">
+                    <button
+                      type="button"
+                      className="thinking-head"
+                      onClick={() => setCollapsedThinking((prev) => ({ ...prev, [m.id]: !prev[m.id] }))}
+                    >
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        {!m.thinkingDone && isStreaming ? (
+                          <Loader2 size={13} className="spin" color="var(--accent)" />
+                        ) : (
+                          <Brain size={13} color="var(--accent)" />
+                        )}
+                        <strong>
+                          {!m.thinkingDone && isStreaming
+                            ? (lang === 'zh' ? '正在深度思考…' : 'Thinking…')
+                            : (lang === 'zh' ? `深度思考过程（${m.thinking.trim().length} 字）` : `Thought Process (${m.thinking.trim().length} chars)`)}
+                        </strong>
+                      </span>
+                      {collapsedThinking[m.id] ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                    </button>
+                    {!collapsedThinking[m.id] && <div className="thinking-body">{m.thinking.trim()}</div>}
+                  </div>
+                )}
+
+                {(m.content.trim() || (m.role === 'assistant' && isStreaming && !m.needApiKey && !m.thinking && !(m.tools && m.tools.length))) && (
                   <div className={`omni-bubble ${m.role}`}>
                     {m.content.trim() ? (
                       renderRichText(m.content)
